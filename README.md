@@ -10,6 +10,8 @@ cd ~/Music
 musort import ~/Downloads/new-album  # identify, tag and move new music in
 musort organize                      # (re)sort everything already in the collection
 musort status                        # what's identified, what isn't, recent runs
+musort log                           # what every run did
+musort undo last                     # changed your mind? put it all back
 ```
 
 ## Commands
@@ -20,6 +22,8 @@ musort status                        # what's identified, what isn't, recent run
 | `organize` | Identify every file in the collection that isn't identified yet, and move everything into the layout. Safe to run as often as you like. |
 | `import SRC` | Identify the music in `SRC` (a folder or one file) and **move** it into the collection. Folders that end up empty are removed; covers and other non-audio files are left in place. `--copy` leaves the source untouched instead. |
 | `status` | Summary from the database: counts, unidentified files, possible duplicates, recent runs. |
+| `log [RUN\|FILE]` | Without arguments: the recent runs (`--all` for every run). With a run (its id, a unique prefix of it, or `last`): every file it moved, copied or retagged, with each tag change. With a file: its whole history, back to where it originally came from. |
+| `undo RUN` | Revert a run (`last` = the latest run that changed something): move files back, restore their old tags exactly, remove copies an `import --copy` made. A file that changed since the run is left alone and reported. `-n` shows what would happen. An undo is a run too, so it can be undone. |
 
 Options for `organize` and `import`:
 
@@ -30,11 +34,21 @@ Options for `organize` and `import`:
 - `--retry`: look up files again that were looked up before and not found.
   Without it, they are skipped until their tags change.
 - `--no-network`: organize by existing tags only.
-- `-v` / `-vv`: narrate every step on its own line instead of a progress
+- `-q, --quick`: quick and loose. musort doesn't walk the directories; it works
+  from what it already knows, and only checks that each file is still there and
+  unchanged (size and mtime). Gone files are skipped and changed files are
+  re-read.
+  - After an interrupted run, it picks up where that run stopped.
+  - `organize -q` otherwise re-checks the files in the database.
+  - `import -q` with nothing to pick up scans normally.
+  - Files added since the last full run aren't noticed. Run without `-q` for
+    that.
+- `-v` / `-vv`: narrate every step on its own line instead of the status
   bar. This covers each file, why a lookup was or wasn't done, every
   MusicBrainz/AcoustID search with its best candidate and score, the match,
-  every tag change and every move. `-vv` adds the raw queries and file reads.
-  The log file always gets all of this, with or without `-v`.
+  every tag change and every move. `-vv` adds the raw queries, file details,
+  and a line for each file that's skipped because nothing about it changed.
+  The run's log file always gets all of this, with or without `-v`.
 - `--root DIR`: use this collection instead of the one found by searching
   upward from the current directory.
 
@@ -78,7 +92,11 @@ common filesystem, including FAT and NTFS USB drives and SMB shares:
 
 - Exact duplicates (byte-identical) and second copies of a recording already
   at its destination go to `_duplicates/`. Nothing is ever deleted, so review
-  them yourself.
+  them yourself. musort finds exact duplicates without reading everything:
+  - only files of the same size can be identical;
+  - of those, only ones with the same quick fingerprint are candidates;
+  - a candidate is only called a duplicate after a full hash of both files
+    agrees.
 - If the destination holds a *different* recording, the newcomer becomes
   `Title [2].ext`.
 - A track without a year tag borrows the year its album-mates have, so one
@@ -88,9 +106,10 @@ common filesystem, including FAT and NTFS USB drives and SMB shares:
 
 - **Nothing is ever overwritten.** Moves use `RENAME_NOREPLACE` (or a hard
   link where that isn't supported).
-- **Moves between filesystems are verified.** The file is copied to a hidden
-  temp file, fsynced and hash-checked, and only then put in place. The
-  original is removed after that, never before.
+- **Moves between filesystems are verified.** The file is hashed while it's
+  copied to a hidden temp file. The copy is fsynced, read back and checked
+  against that hash, and only then put in place. The original is removed
+  after that, never before.
 - **Tag writes are atomic.** Tags are written to a copy, which is read back
   and checked: the tags must be exactly what was meant, and the audio length
   and format must be unchanged. Only then does the copy replace the original.
@@ -99,37 +118,111 @@ common filesystem, including FAT and NTFS USB drives and SMB shares:
   current file finish completely (move, tag write and database record), then
   stops. Pressing again while a file is being handled quits as soon as it's
   done. Pressing again while nothing is being written quits immediately.
-  Run the same command again to continue where it stopped.
+  Run the same command with `-q` to pick up where it stopped without
+  scanning everything again.
 - **Crash recovery.** Multi-step operations are journaled. After a crash,
   power loss or `kill -9`, the next run finishes or rolls back whatever was
   in flight, and logs what it did.
 - **One process at a time.** A lock stops two musort runs from working on
   the same collection at once.
+- **Everything can be undone.** `musort undo <run>` reverts a run from its
+  history, after checking (by quick fingerprint) that each file is still
+  exactly as the run left it.
 
 ## The database is not the source of truth
 
-`.musort/database.db` caches each file's tags, hash and status so unchanged
-files aren't re-read or looked up again. Every run checks it against the
-disk:
-- a row is only trusted if size and mtime match exactly;
-- files that were moved or deleted outside musort are noticed;
-- files retagged by another tool are re-read.
+`.musort/database.db` caches each file's tags, fingerprints and status so
+unchanged files aren't re-read or looked up again.
+
+Every file gets a **quick fingerprint**: a hash of its size plus its first
+and last MiB, where the tags and audio frames sit. That's a fraction of
+reading the whole file, and any real change to the file shows up in it.
+Full content hashes are only computed when they're needed:
+- two files share a size and a quick fingerprint (a possible duplicate);
+- a file is copied across filesystems, where it's hashed during the copy
+  anyway.
+
+A normal run doesn't trust the cache blindly. Every file is fingerprinted
+again; when the fingerprint matches, the cached tags are used, otherwise the
+file is read again. So:
+- files retagged by another tool are noticed, even if the tool kept the
+  modification time;
+- files that were moved or deleted outside musort are noticed too.
+
+`-q` is the loose version: it trusts size and modification time, and doesn't
+fingerprint at all.
+
+What a scan learns is written to the database as it goes, by a background
+writer in batches, so an interrupted scan isn't wasted.
 
 You can delete it at any time. The next `musort organize` rebuilds it without
 moving anything, and without network lookups for files that carry a `ref:`
 tag.
 
+## What you see
+
+A normal run shows one entry per file that actually changed, and a status
+bar at the bottom. The bar has progress and a running tally, plus a line for
+each part of musort saying what it's doing right now:
+- `file`: identifying, moving, writing and verifying tags.
+- `musicbrainz`: each search step with its results, rate-limit waits,
+  fetching tracklists, the match.
+- `acoustid`: fingerprinting and fingerprint lookups. This line only shows
+  when AcoustID is enabled.
+
+A line that's done with the current file stays dimmed, showing its last
+result.
+
+```
+⇉ dl/rip/02.flac                                  tagged · mb 97%
+  → Radiohead/OK Computer (1997)/02 - Paranoid Android.flac
+? dl/loose/x.mp3                                  no match
+  → _unidentified/dl/loose/x.mp3
+
+    sorting  [==========>          ] 61/120  ETA 1m04s   → 40  ✎ 3  ? 2
+       file  01 - Airbag.flac: identifying
+musicbrainz  Radiohead – Airbag: search 2/4: official albums, similar length · waiting 0.8s for the rate limit
+   acoustid  Radiohead – Let Down: no fingerprint match
+```
+
+| symbol | letter | meaning |
+|---|---|---|
+| `→` | `M` | moved |
+| `⇉` | `C` | copied (`import --copy`) |
+| `✎` | `T` | tags written, file was already in place |
+| `?` | `U` | not identified, parked in `_unidentified/` |
+| `≡` | `D` | duplicate, parked in `_duplicates/` (or not copied) |
+| `−` | `R` | `undo`: a copy removed (its original is intact) |
+| `!` | `S` | `undo`: left alone, it changed since |
+| `✗` | `E` | error; the file was left as it was |
+
+The flags say how the file was identified: `mb 97%` (MusicBrainz match and
+score; yellow below 95%), `fp 91%` (AcoustID fingerprint), `tags` (placed by
+its own tags), `ref` (identified on an earlier run). Files with nothing to
+do are not listed. The summary at the end gives the counts, how long it took,
+the lookups made, the log file, and the command to undo the run.
+
+Colors and symbols are used on a terminal; when output is piped, or
+`NO_COLOR` is set, it's plain text with the letters instead.
+
 ## Logging
 
-`.musort/musort.log` is append-only. It records every run with its
-arguments, plus, for every file:
-- the tags read and each lookup's result and score;
-- every tag change, old value to new;
-- every move or copy (with method), every duplicate and unidentified
-  decision;
-- every crash recovery and error.
+Every run that can change something gets two files in `.musort/logs/`,
+named after the moment it started:
 
-Warnings and errors are also shown in the terminal.
+- `2026-10-23_14-02-11_import.log`: the full readable story with timestamps:
+  the arguments, every file's tags, each lookup's queries, candidates and
+  scores, every tag change (old to new), every move or copy (with method),
+  every duplicate and unidentified decision, crash recoveries, and errors.
+  It's everything `-vv` shows, and more.
+- `2026-10-23_14-02-11_import.jsonl`: the history `undo` and `log` work from.
+  Every move, copy and tag change is recorded with its before and after. Each
+  change is written (and fsynced) *before* it happens and confirmed after, so
+  even a crash can't make the history miss one.
+
+Neither is ever deleted or rotated by musort. They're plain files, so
+`grep` works. Unlike the database, the history is not a cache: keep it if
+you want to be able to undo.
 
 ## Config (`.musort/config.toml`)
 

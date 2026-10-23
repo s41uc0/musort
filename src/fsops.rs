@@ -119,10 +119,25 @@ impl std::fmt::Display for RenameError {
 
 impl std::error::Error for RenameError {}
 
-/// Move or copy `src` to `dst` (which must not exist). `expected_hash` is the
-/// hash `src` had when it was scanned; a copy that doesn't match it is
-/// discarded.
-pub fn transfer(db: &Db, run_id: &str, src: &Path, dst: &Path, mode: Mode, expected_hash: &str) -> Result<Method> {
+/// How a file got to its destination, and its full hash if that was computed
+/// on the way (copies hash what they copy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transferred {
+    pub method: Method,
+    pub hash: Option<String>,
+}
+
+/// Move or copy `src` to `dst` (which must not exist). A copy is verified
+/// against the source as it was read; `expected_hash`, if known, is the full
+/// hash `src` should have, and a source that doesn't match it is not copied.
+pub fn transfer(
+    db: &Db,
+    run_id: &str,
+    src: &Path,
+    dst: &Path,
+    mode: Mode,
+    expected_hash: Option<&str>,
+) -> Result<Transferred> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("can't create directory {}", parent.display()))?;
     }
@@ -131,7 +146,7 @@ pub fn transfer(db: &Db, run_id: &str, src: &Path, dst: &Path, mode: Mode, expec
             Ok(()) => {
                 fsync_parent(dst)?;
                 fsync_parent(src)?;
-                return Ok(Method::Rename);
+                return Ok(Transferred { method: Method::Rename, hash: None });
             }
             Err(RenameError::CrossDevice) => {} // fall through to a verified copy
             Err(RenameError::Exists) => bail!("{} already exists", dst.display()),
@@ -143,22 +158,25 @@ pub fn transfer(db: &Db, run_id: &str, src: &Path, dst: &Path, mode: Mode, expec
 
     let tmp = tmp_path_for(dst);
     let op = if mode == Mode::Move { "move" } else { "copy" };
-    let jid = db.journal_begin(run_id, op, src, dst, &tmp, expected_hash)?;
-    let placed = (|| -> Result<()> {
-        copy_verified(src, &tmp, expected_hash)?;
+    let jid = db.journal_begin(run_id, op, src, dst, &tmp, expected_hash.unwrap_or(""))?;
+    let placed = (|| -> Result<String> {
+        let hash = copy_verified(src, &tmp, expected_hash)?;
         match rename_noreplace(&tmp, dst) {
             Ok(()) => {}
             Err(RenameError::Exists) => bail!("{} already exists", dst.display()),
             Err(e) => return Err(e).context("can't put the verified copy in place"),
         }
         fsync_parent(dst)?;
-        Ok(())
+        Ok(hash)
     })();
-    if let Err(e) = placed {
-        let _ = fs::remove_file(&tmp);
-        db.journal_set_state(jid, "rolled-back")?;
-        return Err(e).with_context(|| format!("can't copy {} to {}", src.display(), dst.display()));
-    }
+    let hash = match placed {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            db.journal_set_state(jid, "rolled-back")?;
+            return Err(e).with_context(|| format!("can't copy {} to {}", src.display(), dst.display()));
+        }
+    };
     db.journal_set_state(jid, "placed")?;
 
     if mode == Mode::Move {
@@ -167,24 +185,51 @@ pub fn transfer(db: &Db, run_id: &str, src: &Path, dst: &Path, mode: Mode, expec
         fsync_parent(src)?;
     }
     db.journal_set_state(jid, "done")?;
-    Ok(Method::Copy)
+    Ok(Transferred { method: Method::Copy, hash: Some(hash) })
 }
 
-fn copy_verified(src: &Path, tmp: &Path, expected_hash: &str) -> Result<()> {
+/// Copy `src` to `tmp`, hashing the source as it's read, then read the copy
+/// back from disk and check it hashes the same. Returns the hash.
+fn copy_verified(src: &Path, tmp: &Path, expected_hash: Option<&str>) -> Result<String> {
+    use std::io::{Read, Write};
+
+    use crate::ui::{self, Lane};
     if tmp.symlink_metadata().is_ok() {
         fs::remove_file(tmp)?; // stale leftover of an earlier crash
     }
-    fs::copy(src, tmp)?;
-    let mtime = fs::metadata(src)?.modified()?;
-    let f = fs::OpenOptions::new().write(true).open(tmp)?;
-    f.set_modified(mtime)?;
-    f.sync_all()?;
-    drop(f);
-    let got = hash_file(tmp, false)?;
-    if got != expected_hash {
-        bail!("the copy does not match the original (it changed during the run, or the disk is failing)");
+    let mut from = File::open(src)?;
+    let size = from.metadata()?.len();
+    let mtime = from.metadata()?.modified()?;
+    let mut to = fs::OpenOptions::new().write(true).create_new(true).open(tmp)?;
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        to.write_all(&buf[..n])?;
+        done += n as u64;
+        ui::lane_note(Lane::File, format!("copying {} ({}%)", ui::size(size), done * 100 / size.max(1)));
     }
-    Ok(())
+    let source_hash = format!("{:032x}", h.digest128());
+    if expected_hash.is_some_and(|e| e != source_hash) {
+        bail!("the original changed since it was scanned; not copying it");
+    }
+    ui::lane_note(Lane::File, "flushing the copy to disk");
+    to.set_modified(mtime)?;
+    to.sync_all()?;
+    drop(to);
+    let got = crate::hash::hash_file_with(tmp, false, &|done| {
+        ui::lane_note(Lane::File, format!("verifying the copy ({}%)", done * 100 / size.max(1)));
+    })?;
+    ui::lane_note(Lane::File, "");
+    if got != source_hash {
+        bail!("the copy does not match the original (the disk may be failing)");
+    }
+    Ok(source_hash)
 }
 
 /// `dst`, or `name [2].ext`, `name [3].ext`, ... whichever doesn't exist yet.
@@ -223,7 +268,7 @@ pub fn prune_empty_dirs(dir: &Path, stop_at: &Path) {
     let mut dir = dir.to_path_buf();
     while dir != stop_at && dir.starts_with(stop_at) {
         match fs::remove_dir(&dir) {
-            Ok(()) => info!("removed empty directory {}", dir.display()),
+            Ok(()) => info!("removed empty directory {}", crate::ui::show_outside(&dir)),
             Err(_) => break, // not empty (or gone): stop
         }
         if !dir.pop() {
@@ -247,8 +292,11 @@ pub fn recover(db: &Db) -> Result<usize> {
                 "rolled back: removed the partial copy, the original is untouched".to_string()
             }
             "placed" if j.op == "move" && j.src.exists() => {
-                let dst_ok = j.dst.exists() && hash_file(&j.dst, false)? == j.hash;
-                let src_same = hash_file(&j.src, false)? == j.hash;
+                let src_hash = hash_file(&j.src, false)?;
+                // The journal has the expected hash if it was known up front;
+                // otherwise the two files just have to be identical.
+                let src_same = j.hash.is_empty() || src_hash == j.hash;
+                let dst_ok = j.dst.exists() && hash_file(&j.dst, false)? == src_hash;
                 if dst_ok && src_same {
                     fs::remove_file(&j.src)?;
                     "completed: the copy was verified, removed the original".to_string()
@@ -282,7 +330,7 @@ mod tests {
         fs::write(&a, b"aaa").unwrap();
         fs::write(&b, b"bbb").unwrap();
         let h = hash_file(&a, false).unwrap();
-        assert!(transfer(&db, "t", &a, &b, Mode::Move, &h).is_err());
+        assert!(transfer(&db, "t", &a, &b, Mode::Move, Some(&h)).is_err());
         assert_eq!(fs::read(&a).unwrap(), b"aaa");
         assert_eq!(fs::read(&b).unwrap(), b"bbb");
     }
@@ -294,11 +342,14 @@ mod tests {
         fs::write(&a, b"aaa").unwrap();
         let h = hash_file(&a, false).unwrap();
         let c = d.path().join("x/y/c.mp3");
-        assert_eq!(transfer(&db, "t", &a, &c, Mode::Copy, &h).unwrap(), Method::Copy);
+        let t = transfer(&db, "t", &a, &c, Mode::Copy, None).unwrap();
+        assert_eq!(t, Transferred { method: Method::Copy, hash: Some(h.clone()) });
         assert!(a.exists());
         assert_eq!(fs::read(&c).unwrap(), b"aaa");
+        let c2 = d.path().join("x/y/c2.mp3");
+        assert_eq!(transfer(&db, "t", &a, &c2, Mode::Copy, Some(&h)).unwrap().method, Method::Copy);
         let m = d.path().join("z/m.mp3");
-        assert_eq!(transfer(&db, "t", &a, &m, Mode::Move, &h).unwrap(), Method::Rename);
+        assert_eq!(transfer(&db, "t", &a, &m, Mode::Move, None).unwrap().method, Method::Rename);
         assert!(!a.exists());
         assert_eq!(fs::read(&m).unwrap(), b"aaa");
         assert!(db.journal_pending().unwrap().is_empty());
@@ -310,7 +361,7 @@ mod tests {
         let a = d.path().join("a.mp3");
         fs::write(&a, b"aaa").unwrap();
         let c = d.path().join("c.mp3");
-        assert!(transfer(&db, "t", &a, &c, Mode::Copy, "0000").is_err());
+        assert!(transfer(&db, "t", &a, &c, Mode::Copy, Some("0000")).is_err());
         assert!(!c.exists());
         assert!(!tmp_path_for(&c).exists());
         assert!(a.exists());
@@ -372,5 +423,20 @@ mod tests {
         recover(&db).unwrap();
         assert!(src.exists());
         assert!(dst.exists());
+    }
+
+    #[test]
+    fn recover_without_a_known_hash_compares_the_files() {
+        let (d, db) = setup();
+        for (same, name) in [(true, "a"), (false, "b")] {
+            let (src, dst) = (d.path().join(format!("{name}.src")), d.path().join(format!("{name}.dst")));
+            fs::write(&src, b"sss").unwrap();
+            fs::write(&dst, if same { b"sss" } else { b"xxx" }).unwrap();
+            let id = db.journal_begin("t", "move", &src, &dst, &tmp_path_for(&dst), "").unwrap();
+            db.journal_set_state(id, "placed").unwrap();
+            recover(&db).unwrap();
+            assert_eq!(src.exists(), !same, "{name}");
+            assert!(dst.exists());
+        }
     }
 }

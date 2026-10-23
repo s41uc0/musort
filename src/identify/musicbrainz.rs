@@ -11,6 +11,7 @@ use tracing::{debug, info};
 
 use super::{hints_from_path, similarity, Match, Query, Source};
 use crate::model::TrackMeta;
+use crate::ui::{self, Lane};
 
 const BASE: &str = "https://musicbrainz.org/ws/2";
 
@@ -162,20 +163,27 @@ impl Client {
         let mut attempt = 0;
         loop {
             let wait = self.next_request.saturating_duration_since(Instant::now());
-            std::thread::sleep(wait);
+            if !wait.is_zero() {
+                ui::lane_note(Lane::MusicBrainz, format!("waiting {:.1}s for the rate limit", wait.as_secs_f64()));
+                std::thread::sleep(wait);
+            }
             self.next_request = Instant::now() + Duration::from_millis(1100);
+            ui::lane_note(Lane::MusicBrainz, "waiting for MusicBrainz' answer");
 
             let mut req = self.agent.get(&format!("{BASE}{path}")).query("fmt", "json");
             for (k, v) in query {
                 req = req.query(k, v);
             }
             debug!("      GET {path} {query:?}");
-            match req.call() {
+            let resp = req.call();
+            ui::lane_note(Lane::MusicBrainz, "");
+            match resp {
                 Ok(resp) => return resp.into_json::<T>().context("unexpected response from MusicBrainz"),
                 // Rate limited / overloaded: back off and retry a few times.
                 Err(ureq::Error::Status(code @ (503 | 429 | 502), _)) if attempt < 3 => {
                     attempt += 1;
                     info!("    musicbrainz is busy (HTTP {code}), retrying in {}s", 2 * attempt);
+                    ui::lane_note(Lane::MusicBrainz, format!("busy (HTTP {code}), retrying in {}s", 2 * attempt));
                     self.next_request = Instant::now() + Duration::from_secs(2 * attempt);
                 }
                 Err(ureq::Error::Status(404, _)) => bail!(NotFound),
@@ -190,6 +198,7 @@ impl Client {
             return Ok(r.clone());
         }
         info!("    musicbrainz: fetching the tracklist of release {id}");
+        ui::step(Lane::MusicBrainz, "fetching the album's tracklist");
         let r: Release = self.get(
             &format!("/release/{id}"),
             &[("inc", "artist-credits+recordings+release-groups")],
@@ -205,6 +214,7 @@ impl Client {
         let m = q.meta;
         let Some(title) = m.title.clone().or(hints.title.clone()) else {
             info!("  musicbrainz: no title in the tags or the file name to search with");
+            ui::step(Lane::MusicBrainz, "no title to search with");
             return Ok(None);
         };
         // A folder name is too unreliable to score releases with (it would favour
@@ -267,20 +277,31 @@ impl Client {
         let dir = q.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut best: Option<(u8, Recording, ReleaseSummary)> = None;
         for (i, (label, query, require_album)) in tiers.iter().enumerate() {
+            ui::step(Lane::MusicBrainz, format_args!("search {}/{}: {label}", i + 1, tiers.len()));
             let res: SearchResult = self.get("/recording", &[("query", query), ("limit", "25")])?;
             info!("    search {}, {label}: {} recording(s)", i + 1, res.recordings.len());
             debug!("      query: {query}");
+            let n = res.recordings.len();
             let c = self.pick(&wanted, res.recordings, &dir, *require_album);
             match &c {
-                Some((score, rec, rel)) => info!(
-                    "      best: {} - {} on \"{}\"{} ({score}%{})",
-                    credit(&rec.artist_credit).unwrap_or_default(),
-                    rec.title,
-                    rel.title,
-                    year_of(&rel.date).map(|y| format!(" ({y})")).unwrap_or_default(),
-                    if *score >= self.min_score { ", confident" } else { ", not confident enough" }
-                ),
-                None => info!("      nothing usable"),
+                Some((score, rec, rel)) => {
+                    info!(
+                        "      best: {} - {} on \"{}\"{} ({score}%{})",
+                        credit(&rec.artist_credit).unwrap_or_default(),
+                        rec.title,
+                        rel.title,
+                        year_of(&rel.date).map(|y| format!(" ({y})")).unwrap_or_default(),
+                        if *score >= self.min_score { ", confident" } else { ", not confident enough" }
+                    );
+                    ui::step(
+                        Lane::MusicBrainz,
+                        format_args!("search {}/{}: {n} result(s), best {score}% on \"{}\"", i + 1, tiers.len(), rel.title),
+                    );
+                }
+                None => {
+                    info!("      nothing usable");
+                    ui::step(Lane::MusicBrainz, format_args!("search {}/{}: {n} result(s), none usable", i + 1, tiers.len()));
+                }
             }
             if let Some(c) = c {
                 if best.as_ref().is_none_or(|b| c.0 > b.0) {
@@ -294,6 +315,7 @@ impl Client {
 
         let Some((score, rec, rel)) = best else {
             info!("  musicbrainz: nothing found");
+            ui::step(Lane::MusicBrainz, "nothing found");
             return Ok(None);
         };
         if score < self.min_score {
@@ -304,12 +326,17 @@ impl Client {
                 rel.title,
                 self.min_score
             );
+            ui::step(
+                Lane::MusicBrainz,
+                format_args!("no confident match (best {score}%, \"{}\", needs {}%)", rel.title, self.min_score),
+            );
             return Ok(None);
         }
         let mut found = self.complete(&rec.id, &rel.id, score, Source::MusicBrainz)?;
         if let Some(found) = &mut found {
             found.meta.ref_musicbrainz = Some(rec.id.clone());
             self.dir_release.insert(dir, rel.id.clone());
+            ui::step(Lane::MusicBrainz, format_args!("matched {} ({score}%)", found.meta.summary()));
         }
         Ok(found)
     }
@@ -317,6 +344,7 @@ impl Client {
     /// Look up a known recording id (from AcoustID) and choose a release for it.
     pub fn by_recording(&mut self, q: &Query<'_>, recording_id: &str, score: u8) -> Result<Option<Match>> {
         info!("    musicbrainz: looking up recording {recording_id}");
+        ui::step(Lane::MusicBrainz, format_args!("looking up recording {recording_id} (from the fingerprint)"));
         let rec: Recording = match self.get(
             &format!("/recording/{recording_id}"),
             &[("inc", "artist-credits+releases+release-groups+media")],
@@ -336,8 +364,9 @@ impl Client {
             return Ok(None);
         };
         let found = self.complete(&rec.id, &rel.id, score, Source::AcoustId)?;
-        if found.is_some() {
+        if let Some(f) = &found {
             self.dir_release.insert(dir, rel.id.clone());
+            ui::step(Lane::MusicBrainz, format_args!("fingerprint's recording: {}", f.meta.summary()));
         }
         Ok(found)
     }

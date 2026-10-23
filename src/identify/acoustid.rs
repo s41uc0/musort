@@ -74,12 +74,14 @@ impl Client {
 
     pub fn lookup(&mut self, path: &Path) -> Result<Vec<Hit>> {
         let fp = fingerprint(path)?;
+        crate::ui::step(crate::ui::Lane::AcoustId, "looking up the fingerprint");
         // AcoustID allows 3 requests per second.
         std::thread::sleep(self.next_request.saturating_duration_since(Instant::now()));
         self.next_request = Instant::now() + Duration::from_millis(350);
 
         let duration = (fp.duration.round() as u64).to_string();
         debug!("    acoustid: lookup with a {duration}s fingerprint");
+        crate::ui::lane_note(crate::ui::Lane::AcoustId, "waiting for AcoustID's answer");
         let resp = self
             .agent
             .post("https://api.acoustid.org/v2/lookup")

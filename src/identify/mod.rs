@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use crate::cli::ForceSource;
 use crate::config::Config;
 use crate::model::TrackMeta;
+use crate::ui::{self, Lane};
 
 /// Runs the enabled (or forced) identification sources, in order.
 pub struct Engine {
@@ -68,6 +69,16 @@ impl Engine {
         !self.sources.is_empty() && !self.offline
     }
 
+    /// Whether `source` is used for lookups (AcoustID also needs MusicBrainz,
+    /// to turn a fingerprint's recording into tags).
+    pub fn uses(&self, source: Source) -> bool {
+        self.active()
+            && match source {
+                Source::MusicBrainz => self.mb.is_some(),
+                Source::AcoustId => self.sources.contains(&Source::AcoustId),
+            }
+    }
+
     pub fn identify(&mut self, q: &Query<'_>) -> Outcome {
         if !self.active() {
             return Outcome::NotFound;
@@ -106,27 +117,36 @@ impl Engine {
 
     fn via_acoustid(&mut self, q: &Query<'_>) -> Result<Option<Match>> {
         info!("  acoustid: fingerprinting the audio and looking it up");
+        ui::step(Lane::AcoustId, "fingerprinting the audio (fpcalc)");
         let hits = self.acoustid.as_mut().expect("acoustid client").lookup(q.path)?;
         for h in hits.iter().take(5) {
             info!("    fingerprint match {} ({}%), {} recording(s)", h.acoustid, h.score, h.recordings.len());
         }
-        if hits.is_empty() {
-            info!("    no fingerprint matches");
+        match hits.first() {
+            Some(best) => ui::step(
+                Lane::AcoustId,
+                format_args!("{} fingerprint match(es), best {}% ({} recording(s))", hits.len(), best.score, best.recordings.len()),
+            ),
+            None => {
+                info!("    no fingerprint matches");
+                ui::step(Lane::AcoustId, "no fingerprint match");
+            }
         }
         for hit in hits.iter().filter(|h| h.score >= self.min_score).take(3) {
             for rec in hit.recordings.iter().take(5) {
                 let mb = self.mb.as_mut().expect("mb client");
                 if let Some(mut m) = mb.by_recording(q, rec, hit.score)? {
                     m.meta.ref_acoustid = Some(hit.acoustid.clone());
+                    ui::step(Lane::AcoustId, format_args!("matched fingerprint {} ({}%)", hit.acoustid, hit.score));
                     return Ok(Some(m));
                 }
             }
         }
-        info!(
-            "  acoustid: no confident match (best fingerprint score {}%, min_score {})",
-            hits.first().map(|h| h.score).unwrap_or(0),
-            self.min_score
-        );
+        let best = hits.first().map(|h| h.score).unwrap_or(0);
+        info!("  acoustid: no confident match (best fingerprint score {best}%, min_score {})", self.min_score);
+        if !hits.is_empty() {
+            ui::step(Lane::AcoustId, format_args!("no confident match (best {best}%, needs {}%)", self.min_score));
+        }
         Ok(None)
     }
 }

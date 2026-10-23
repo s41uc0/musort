@@ -22,8 +22,9 @@ impl Collection {
     pub fn config_path(&self) -> PathBuf {
         self.dir().join("config.toml")
     }
-    pub fn log_path(&self) -> PathBuf {
-        self.dir().join("musort.log")
+    /// One readable `.log` and one `.jsonl` history per run.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.dir().join("logs")
     }
 
     /// Find the collection for `start` (or the current directory): the nearest

@@ -11,8 +11,8 @@ pub struct Cli {
     pub root: Option<PathBuf>,
 
     /// Show what musort is doing, one line per step (lookups and their
-    /// results, skipped files, ...) instead of a progress bar. -vv shows even
-    /// more. Everything is always written to .musort/musort.log regardless.
+    /// results, ...) instead of a status bar. -vv shows even more (skipped
+    /// files, raw queries). Every run's full log is in .musort/logs/ regardless.
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
@@ -41,6 +41,24 @@ pub enum Command {
     },
     /// Show what the collection looks like as of the last run
     Status,
+    /// Show what musort did: recent runs, everything one run changed, or the
+    /// history of one file
+    Log {
+        /// A run (its id, a unique prefix of it, or `last`) or a file path.
+        /// Without it, lists recent runs.
+        target: Option<String>,
+        /// List all runs, not just the recent ones
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revert what a run did: move files back and restore their old tags
+    Undo {
+        /// The run to undo: its id (see `musort log`), a unique prefix, or `last`
+        run: String,
+        /// Show what would be undone without changing anything
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -61,6 +79,13 @@ pub struct RunArgs {
     /// Don't contact MusicBrainz/AcoustID; organize using existing tags only
     #[arg(long, conflicts_with = "force")]
     pub no_network: bool,
+
+    /// Quick and loose: don't walk the directories, work from what musort
+    /// already knows, only checking that each file is still there and
+    /// unchanged. Picks up an interrupted run where it stopped. Files added
+    /// since aren't noticed; run without -q for that.
+    #[arg(long, short = 'q')]
+    pub quick: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]

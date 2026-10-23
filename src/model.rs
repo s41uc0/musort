@@ -22,7 +22,7 @@ pub struct TrackMeta {
 }
 
 /// Everything read from one audio file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FileInfo {
     pub format: String,
     pub duration_ms: u64,

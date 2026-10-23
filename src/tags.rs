@@ -114,11 +114,22 @@ fn clean(s: Option<Cow<'_, str>>) -> Option<String> {
 /// Returns the fields that changed.
 pub fn write(path: &Path, new: &TrackMeta) -> Result<Vec<(&'static str, String, String)>> {
     let before = read(path)?;
+    let mut wanted = before.meta.clone();
+    overlay(&mut wanted, new);
+    rewrite(path, before, wanted)
+}
+
+/// Make the file's tags exactly `exact`: fields that are `None` there are
+/// removed from the file. This is how `undo` puts the old tags back.
+pub fn restore(path: &Path, exact: &TrackMeta) -> Result<Vec<(&'static str, String, String)>> {
+    let before = read(path)?;
+    rewrite(path, before, exact.clone())
+}
+
+fn rewrite(path: &Path, before: FileInfo, wanted: TrackMeta) -> Result<Vec<(&'static str, String, String)>> {
     if !before.writable {
         bail!("musort can't safely write tags to {} files", before.format);
     }
-    let mut wanted = before.meta.clone();
-    overlay(&mut wanted, new);
     let changes = before.meta.diff(&wanted);
     if changes.is_empty() {
         return Ok(changes);
@@ -136,7 +147,10 @@ pub fn write(path: &Path, new: &TrackMeta) -> Result<Vec<(&'static str, String, 
             // the primary one, so carry everything over into it.
             concrete.apply(&wanted);
         } else {
-            concrete.apply(&only_changed(&before.meta, &wanted));
+            let reset = concrete.clear(&before.meta, &wanted);
+            let mut set = only_changed(&before.meta, &wanted);
+            overlay(&mut set, &reset);
+            concrete.apply(&set);
         }
         concrete.save(&tmp)?;
         crate::fsops::fsync_file(&tmp)?;
@@ -341,6 +355,114 @@ impl Concrete {
         }
     }
 
+    fn unset(&mut self, which: Extra) {
+        match self {
+            Concrete::Id3(t) => match which {
+                Extra::AlbumArtist => {
+                    let _ = t.remove(&FrameId::Valid(Cow::Borrowed("TPE2")));
+                }
+                Extra::MbRecordingId => {
+                    t.retain(|f| !matches!(f, Frame::UniqueFileIdentifier(u) if u.owner == MB_UFID_OWNER));
+                }
+                Extra::MbReleaseId => {
+                    t.remove_user_text("MusicBrainz Album Id");
+                }
+                Extra::RefMusicbrainz => {
+                    t.remove_user_text(REF_MUSICBRAINZ);
+                }
+                Extra::RefAcoustid => {
+                    t.remove_user_text(REF_ACOUSTID);
+                }
+            },
+            Concrete::Vorbis(t) => {
+                let _ = t.remove(vorbis_key(which));
+            }
+            Concrete::Mp4(t) => {
+                let _ = t.remove(&mp4_ident(which));
+            }
+        }
+    }
+
+    /// Remove the fields `cur` has and `want` doesn't. Returns fields that
+    /// must be set again afterwards: a number and its total share one frame,
+    /// so removing one removes both.
+    fn clear(&mut self, cur: &TrackMeta, want: &TrackMeta) -> TrackMeta {
+        fn gone<T>(cur: &Option<T>, want: &Option<T>) -> bool {
+            cur.is_some() && want.is_none()
+        }
+        // `totals`: whether the totals are stored apart from the numbers. (ID3's
+        // remove_disk_total also has a bug that copies the track number into
+        // the disc frame, so it must not be called.)
+        fn acc<T: Accessor>(t: &mut T, cur: &TrackMeta, want: &TrackMeta, reset: &mut TrackMeta, totals: bool) {
+            if gone(&cur.title, &want.title) {
+                t.remove_title();
+            }
+            if gone(&cur.artist, &want.artist) {
+                t.remove_artist();
+            }
+            if gone(&cur.album, &want.album) {
+                t.remove_album();
+            }
+            if gone(&cur.genre, &want.genre) {
+                t.remove_genre();
+            }
+            if gone(&cur.track, &want.track) || gone(&cur.track_total, &want.track_total) {
+                t.remove_track();
+                if totals {
+                    t.remove_track_total();
+                }
+                reset.track = want.track;
+                reset.track_total = want.track_total;
+            }
+            if gone(&cur.disc, &want.disc) || gone(&cur.disc_total, &want.disc_total) {
+                t.remove_disk();
+                if totals {
+                    t.remove_disk_total();
+                }
+                reset.disc = want.disc;
+                reset.disc_total = want.disc_total;
+            }
+        }
+        let mut reset = TrackMeta::default();
+        let year_gone = gone(&cur.year, &want.year);
+        match self {
+            Concrete::Id3(t) => {
+                acc(t, cur, want, &mut reset, false);
+                if year_gone {
+                    for id in ["TDRC", "TYER", "TDAT"] {
+                        let _ = t.remove(&FrameId::Valid(Cow::Borrowed(id)));
+                    }
+                }
+            }
+            Concrete::Vorbis(t) => {
+                acc(t, cur, want, &mut reset, true);
+                if year_gone {
+                    t.remove_year();
+                }
+            }
+            Concrete::Mp4(t) => {
+                acc(t, cur, want, &mut reset, true);
+                if year_gone {
+                    // (lofty's remove_year looks for the wrong atom.)
+                    let _ = t.remove(&AtomIdent::Fourcc(*b"\xa9day"));
+                }
+            }
+        }
+        let extras = [
+            (Extra::AlbumArtist, &cur.album_artist, &want.album_artist),
+            (Extra::MbRecordingId, &cur.mb_recording_id, &want.mb_recording_id),
+            (Extra::MbReleaseId, &cur.mb_release_id, &want.mb_release_id),
+            (Extra::RefMusicbrainz, &cur.ref_musicbrainz, &want.ref_musicbrainz),
+            (Extra::RefAcoustid, &cur.ref_acoustid, &want.ref_acoustid),
+        ];
+        for (which, c, w) in extras {
+            if gone(c, w) {
+                self.unset(which);
+            }
+        }
+        reset
+    }
+
     fn apply(&mut self, m: &TrackMeta) {
         fn acc<T: Accessor>(t: &mut T, m: &TrackMeta, set_year: bool) {
             if let Some(v) = &m.title {
@@ -506,6 +628,12 @@ mod tests {
                 "{name}: custom tag lost:\n{out}"
             );
         }
+
+        // Undo: the old tags come back exactly, added fields are removed.
+        restore(&p, &before.meta).unwrap();
+        let undone = read(&p).unwrap();
+        assert_eq!(undone.meta, before.meta, "{name}: restore");
+        assert_eq!(undone.duration_ms, before.duration_ms);
     }
 
     #[test]
@@ -557,8 +685,25 @@ mod tests {
     fn untagged_mp3_gets_a_tag() {
         let d = tempfile::tempdir().unwrap();
         let Some(p) = make(d.path(), "a.mp3", &[]) else { return };
+        let before = read(&p).unwrap();
         write(&p, &identified()).unwrap();
         assert_eq!(read(&p).unwrap().meta.title, identified().title);
+        restore(&p, &before.meta).unwrap();
+        assert_eq!(read(&p).unwrap().meta, before.meta);
+    }
+
+    #[test]
+    fn restore_keeps_track_number_when_only_total_goes() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["a.mp3", "a.flac", "a.m4a"] {
+            let Some(p) = make(d.path(), name, &["-metadata", "title=T", "-metadata", "track=4"]) else { return };
+            let before = read(&p).unwrap();
+            assert_eq!(before.meta.track, Some(4));
+            write(&p, &TrackMeta { track_total: Some(9), disc: Some(1), disc_total: Some(2), ..Default::default() })
+                .unwrap();
+            restore(&p, &before.meta).unwrap();
+            assert_eq!(read(&p).unwrap().meta, before.meta, "{name}");
+        }
     }
 
     #[test]

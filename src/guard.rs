@@ -50,6 +50,11 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+/// Stop after the current step, as a first Ctrl+C would.
+pub fn request_stop() {
+    STOP.store(true, Ordering::SeqCst);
+}
+
 pub fn stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use chrono::{Local, TimeZone};
 
 use crate::collection::Collection;
 use crate::db::{Db, Status};
@@ -12,6 +11,7 @@ pub fn status(coll: &Collection, db: &Db) -> Result<()> {
 
     let mut by: BTreeMap<String, usize> = BTreeMap::new();
     let mut unidentified = vec![];
+    let mut new = 0;
     let mut recordings: HashMap<&str, Vec<&std::path::Path>> = HashMap::new();
     for row in rows.values() {
         match row.status {
@@ -22,6 +22,7 @@ pub fn status(coll: &Collection, db: &Db) -> Result<()> {
                 }
             }
             Status::Unidentified => unidentified.push(&row.path),
+            Status::New => new += 1,
         }
     }
     let organized: usize = by.values().sum();
@@ -31,6 +32,9 @@ pub fn status(coll: &Collection, db: &Db) -> Result<()> {
         if detail.is_empty() { "none".into() } else { detail.join(", ") },
         unidentified.len()
     );
+    if new > 0 {
+        println!("{new} file(s) found by a scan but not sorted yet (run `musort organize`, or -q to pick up where it stopped)");
+    }
 
     if !unidentified.is_empty() {
         unidentified.sort();
@@ -63,22 +67,20 @@ pub fn status(coll: &Collection, db: &Db) -> Result<()> {
         );
     }
 
-    let runs = db.recent_runs(5)?;
+    let runs = crate::history::list(&coll.logs_dir())?;
     if !runs.is_empty() {
         println!("\nrecent runs:");
-        for run in runs {
-            let when = Local
-                .timestamp_opt(run.started, 0)
-                .single()
-                .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_default();
-            let state = match (run.finished, run.interrupted) {
-                (None, _) => "did not finish",
-                (Some(_), true) => "interrupted",
-                (Some(_), false) => "ok",
+        for run in runs.iter().rev().take(5).rev() {
+            let state = match &run.finish {
+                None => "did not finish",
+                Some((_, s)) if s.interrupted => "interrupted",
+                Some((_, s)) if s.errors > 0 => "finished with errors",
+                Some(_) => "ok",
             };
-            println!("  {when}  {:<9} {state}", run.command);
+            let dry = if run.start.dry_run { " (dry run)" } else { "" };
+            println!("  {}  {:<9} {state}{dry}", run.id(), run.start.command);
         }
+        println!("  (details: `musort log`)");
     }
     println!("\n(as of the last run; the files themselves are the source of truth. Run `musort organize` to refresh.)");
     Ok(())

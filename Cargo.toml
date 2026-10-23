@@ -8,6 +8,7 @@ description = "An idiot-proof music collection organizer"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
+console = { version = "0.15", default-features = false }
 ctrlc = "3"
 indicatif = "0.17"
 lofty = "0.21"
