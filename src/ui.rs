@@ -12,6 +12,7 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle};
 
@@ -380,6 +381,7 @@ pub fn start(total: Option<u64>, prefix: &str) -> ProgressBar {
         *s = LaneState { text: String::new(), note: String::new(), fresh: false };
     }
     *HEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *ETA.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let shown = NEXT_LANES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| vec![Lane::File]);
     if verbose() {
         let pb = ProgressBar::with_draw_target(total, ProgressDrawTarget::hidden());
@@ -396,6 +398,13 @@ pub fn start(total: Option<u64>, prefix: &str) -> ProgressBar {
     let mut style = ProgressStyle::with_template(&template)
         .expect("valid template")
         .progress_chars("=> ")
+        .with_key("eta", |s: &ProgressState, w: &mut dyn std::fmt::Write| {
+            let _ = match eta_left(s) {
+                Some((left, Some(each))) => write!(w, "{:#} @ ~{}/item", indicatif::HumanDuration(left), per_item(each)),
+                Some((left, None)) => write!(w, "{:#}", indicatif::HumanDuration(left)),
+                None => w.write_str("?"),
+            };
+        })
         .with_key("tally", |_: &ProgressState, w: &mut dyn std::fmt::Write| {
             let _ = w.write_str(&tally());
         })
@@ -415,6 +424,112 @@ pub fn start(total: Option<u64>, prefix: &str) -> ProgressBar {
     pb.set_prefix(prefix.to_string());
     *BAR.lock().unwrap_or_else(|e| e.into_inner()) = Some(pb.clone());
     pb
+}
+
+// ---- ETA ----
+
+/// What the ETA is based on when the items are of kinds that cost very
+/// different amounts of time (an online lookup takes a second or more, a
+/// file already in place a fraction of a millisecond): per kind, how many
+/// are left and how long the finished ones took.
+struct Eta {
+    kinds: Vec<Kind>,
+    /// The item being handled: its kind and when it started.
+    current: Option<(usize, Instant)>,
+}
+
+struct Kind {
+    left: u64,
+    done: u32,
+    spent: Duration,
+    /// What one costs until one has been timed (None: the average of all
+    /// items timed so far).
+    guess: Option<Duration>,
+}
+
+static ETA: Mutex<Option<Eta>> = Mutex::new(None);
+
+/// Base the current bar's ETA on kinds of items, given as `(count, guess)`
+/// (see [`Kind`]); report each item with [`eta_begin`] and [`eta_end`].
+/// Without this, the ETA is the average time per item so far times the
+/// number left.
+pub fn eta_kinds(kinds: &[(u64, Option<Duration>)]) {
+    let kinds = kinds.iter().map(|&(left, guess)| Kind { left, done: 0, spent: Duration::ZERO, guess }).collect();
+    *ETA.lock().unwrap_or_else(|e| e.into_inner()) = Some(Eta { kinds, current: None });
+}
+
+/// An item of kind `kind` (an index into what [`eta_kinds`] got) starts.
+pub fn eta_begin(kind: usize) {
+    if let Some(eta) = ETA.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let k = &mut eta.kinds[kind];
+        k.left = k.left.saturating_sub(1);
+        eta.current = Some((kind, Instant::now()));
+    }
+}
+
+/// The item started with [`eta_begin`] is done.
+pub fn eta_end() {
+    if let Some(eta) = ETA.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        if let Some((kind, start)) = eta.current.take() {
+            let k = &mut eta.kinds[kind];
+            k.done += 1;
+            k.spent += start.elapsed();
+        }
+    }
+}
+
+impl Eta {
+    /// The time left, and what an item still to do costs on average.
+    fn left(&self) -> Option<(Duration, Option<Duration>)> {
+        let (done, spent) = self.kinds.iter().fold((0, Duration::ZERO), |(n, t), k| (n + k.done, t + k.spent));
+        let overall = (done > 0).then(|| spent / done);
+        let average = |k: &Kind| if k.done > 0 { Some(k.spent / k.done) } else { k.guess.or(overall) };
+        let (mut items, mut total) = (0, Duration::ZERO);
+        for k in self.kinds.iter().filter(|k| k.left > 0) {
+            items += k.left;
+            total += average(k)?.mul_f64(k.left as f64);
+        }
+        // The item being handled has part of its time behind it (an item
+        // taking longer than average just holds the ETA where it is).
+        let mut behind = Duration::ZERO;
+        if let Some((kind, start)) = self.current {
+            let avg = average(&self.kinds[kind])?;
+            items += 1;
+            total += avg;
+            behind = start.elapsed().min(avg);
+        }
+        let each = (items > 0).then(|| total.div_f64(items as f64));
+        Some((total - behind, each))
+    }
+}
+
+/// Time left for the bar, and per item: None when there's nothing to go on yet.
+fn eta_left(s: &ProgressState) -> Option<(Duration, Option<Duration>)> {
+    if let Some(eta) = ETA.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return eta.left();
+    }
+    let (pos, len) = (s.pos(), s.len()?);
+    if pos == 0 {
+        return None;
+    }
+    let each = s.elapsed().div_f64(pos as f64);
+    let left = len.saturating_sub(pos);
+    Some((each.mul_f64(left as f64), (left > 0).then_some(each)))
+}
+
+/// A time per item, which can be well under a millisecond: "1.2s", "35ms",
+/// "0.4ms".
+fn per_item(d: Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms >= 60_000.0 {
+        format!("{:#}", indicatif::HumanDuration(d))
+    } else if ms >= 1000.0 {
+        format!("{:.1}s", ms / 1000.0)
+    } else if ms >= 10.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{ms:.1}ms")
+    }
 }
 
 pub fn finish() {

@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -216,11 +217,29 @@ impl<'a> Pipeline<'a> {
         }
         ui::show_lanes(&lanes);
         let pb = ui::start(Some(total as u64), if self.args.dry_run { "planning" } else { "sorting" });
+        // The ETA times these kinds separately: a lookup is about a second
+        // (MusicBrainz's limit), a file already in place usually just stays,
+        // and other files are moved or copied.
+        let kind = |p: &Self, s: &Scanned| {
+            if p.engine.active() && p.needs_lookup(s) {
+                0
+            } else if s.row.as_ref().is_some_and(|r| r.status == Status::Organized) {
+                1
+            } else {
+                2
+            }
+        };
+        let mut counts = [0u64; 3];
+        for s in &items {
+            counts[kind(self, s)] += 1;
+        }
+        ui::eta_kinds(&[(counts[0], Some(Duration::from_secs(1))), (counts[1], None), (counts[2], None)]);
         for (i, item) in items.into_iter().enumerate() {
             if guard::stop_requested() {
                 self.stats.interrupted = true;
                 break;
             }
+            ui::eta_begin(kind(self, &item));
             self.item = i + 1;
             let name = item.abs.file_name().unwrap_or_default().to_string_lossy().into_owned();
             let origin = self.origin_rel(&item.abs).display().to_string();
@@ -257,6 +276,7 @@ impl<'a> Pipeline<'a> {
                     self.db.worklist_done(&item.abs);
                 }
             }
+            ui::eta_end();
             pb.inc(1);
             if stop_after == Some(self.stats.handled) {
                 guard::request_stop();
