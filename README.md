@@ -180,7 +180,7 @@ result.
   → _unidentified/dl/loose/x.mp3
 
     sorting  [==========>          ] 61/120  ETA 1m @ 1.1s/item   → 40  ✎ 3  ? 2
-       file  01 - Airbag.flac: identifying
+       file   31 MB  01 - Airbag.flac: identifying
 musicbrainz  Radiohead – Airbag: search 2/4: official albums, similar length · waiting 0.8s for the rate limit
    acoustid  Radiohead – Let Down: no fingerprint match
 ```

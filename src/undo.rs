@@ -55,8 +55,10 @@ pub fn undo(coll: &Collection, db: &Db, run_id: &str, hist: &History, target: &R
             break;
         }
         u.item = i + 1;
-        let shown = u.show(&final_path(coll, group));
+        let path = final_path(coll, group);
+        let shown = u.show(&path);
         info!("[{}/{total}] {shown}", i + 1);
+        ui::file_size(std::fs::metadata(&path).ok().map(|m| m.len()));
         ui::status(format!("{shown}: checking it's as the run left it"));
         if let Err(e) = u.item(group) {
             u.stats.errors += 1;

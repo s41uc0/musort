@@ -223,10 +223,14 @@ struct LaneState {
     /// Whether it's about the current file (else it's the last thing that
     /// part did, shown dimmed).
     fresh: bool,
+    /// The file line: the size of the file it's about.
+    size: Option<u64>,
 }
 
 static LANES: Mutex<[LaneState; LANE_COUNT]> =
-    Mutex::new([const { LaneState { text: String::new(), note: String::new(), fresh: false } }; LANE_COUNT]);
+    Mutex::new([const { LaneState { text: String::new(), note: String::new(), fresh: false, size: None } }; LANE_COUNT]);
+/// The size of the current file, for the file line's next text.
+static FILE_SIZE: Mutex<Option<u64>> = Mutex::new(None);
 /// The lines the next status bar shows (None: just the file line).
 static NEXT_LANES: Mutex<Option<Vec<Lane>>> = Mutex::new(None);
 /// Text after the phase name on the first line, computed at each redraw.
@@ -305,11 +309,12 @@ fn render_jobs() -> String {
     parts.join(sym(" · ", ", "))
 }
 
-/// `52 MB`, `1.2 GB`.
+/// `840 kB`, `4.7 MB`, `52 MB`, `1.2 GB`.
 pub fn size(bytes: u64) -> String {
     match bytes {
         0..1_000_000 => format!("{} kB", bytes / 1000),
-        1_000_000..1_000_000_000 => format!("{} MB", bytes / 1_000_000),
+        1_000_000..10_000_000 => format!("{:.1} MB", (bytes / 100_000) as f64 / 10.0),
+        10_000_000..1_000_000_000 => format!("{} MB", bytes / 1_000_000),
         _ => format!("{:.1} GB", bytes as f64 / 1e9),
     }
 }
@@ -332,6 +337,9 @@ pub fn lane(l: Lane, msg: impl Into<String>) {
         s.text = msg.into();
         s.note.clear();
         s.fresh = true;
+        if l == Lane::File {
+            s.size = *FILE_SIZE.lock().unwrap_or_else(|e| e.into_inner());
+        }
     }
     redraw();
 }
@@ -340,6 +348,12 @@ pub fn lane(l: Lane, msg: impl Into<String>) {
 pub fn lane_note(l: Lane, note: impl Into<String>) {
     lanes()[l as usize].note = note.into();
     redraw();
+}
+
+/// The size of the file the file line's next texts are about (None: no
+/// size shown).
+pub fn file_size(bytes: Option<u64>) {
+    *FILE_SIZE.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
 }
 
 /// A new file: every line now describes the previous one, until updated.
@@ -362,6 +376,10 @@ fn render_lane(i: usize, w: &mut dyn std::fmt::Write) {
         if !s.note.is_empty() {
             text = format!("{text}{}{}", sym(" · ", ", "), s.note);
         }
+        if let Some(bytes) = s.size.filter(|_| !s.text.is_empty()) {
+            // Right-aligned, so the file names stay in one column.
+            text = format!("{:>6}  {text}", size(bytes));
+        }
         (text, s.fresh)
     };
     let width = console::Term::stderr().size_checked().map(|(_, w)| w as usize).unwrap_or(100);
@@ -378,10 +396,11 @@ pub fn start(total: Option<u64>, prefix: &str) -> ProgressBar {
         t.store(0, Ordering::Relaxed);
     }
     for s in lanes().iter_mut() {
-        *s = LaneState { text: String::new(), note: String::new(), fresh: false };
+        *s = LaneState { text: String::new(), note: String::new(), fresh: false, size: None };
     }
     *HEADLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *ETA.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    file_size(None);
     let shown = NEXT_LANES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_else(|| vec![Lane::File]);
     if verbose() {
         let pb = ProgressBar::with_draw_target(total, ProgressDrawTarget::hidden());

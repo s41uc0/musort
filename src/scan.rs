@@ -310,6 +310,7 @@ pub fn resume(items: Vec<WorkItem>, root: &Path, cache: &HashMap<PathBuf, TrackR
         }
         let rel = item.path.strip_prefix(root).unwrap_or(&item.path).display().to_string();
         if !item.done {
+            ui::file_size(Some(item.size));
             ui::status(format!("{rel}: checking it's still there and unchanged"));
             pb.inc(1);
         }

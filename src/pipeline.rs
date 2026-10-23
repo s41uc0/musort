@@ -246,6 +246,7 @@ impl<'a> Pipeline<'a> {
             // Files that are skipped get their status after processing (it's quick),
             // so the line doesn't flicker between "name" and "skipped name".
             ui::new_file();
+            ui::file_size(Some(item.size));
             if self.needs_lookup(&item) && self.engine.active() {
                 let m = &item.info.meta;
                 ui::subject(match &m.title {
@@ -286,6 +287,7 @@ impl<'a> Pipeline<'a> {
             self.stats.interrupted = true;
         }
         if !self.args.dry_run && !self.vacated.is_empty() {
+            ui::file_size(None);
             ui::status(format!("removing folders that are empty now ({} checked)", self.vacated.len()));
             self.prune();
         }
